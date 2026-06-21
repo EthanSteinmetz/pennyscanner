@@ -69,14 +69,14 @@ def log(*a):
     print(*a, flush=True)
 
 
-def fetch(url):
+def fetch(url, timeout=30):
     req = urllib.request.Request(url, headers={
         "User-Agent": UA,
         "Accept": "text/html,application/xhtml+xml,*/*",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, identity",
     })
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         data = resp.read()
         if resp.headers.get("Content-Encoding") == "gzip":
             data = gzip.decompress(data)
@@ -151,7 +151,7 @@ def detail_url(sku):
 
 def enrich_with_towns(find):
     try:
-        page = fetch(detail_url(find["sku"]))
+        page = fetch(detail_url(find["sku"]), timeout=12)
     except Exception as e:
         log(f"[detail] {find['sku']}: {e}")
         find["towns"] = []
@@ -243,24 +243,32 @@ def main():
         log(f"[debug] page len {len(page)}")
         for tok in ["$0.01", "SKU", "homedepot.com", "__next_f", "pennycentral"]:
             log(f"[debug] contains {tok!r}: {tok in page}")
-        anchor = page.find("$0.01")
-        if anchor == -1:
-            anchor = page.find("SKU")
-        if anchor != -1:
-            window = page[max(0, anchor - 200):anchor + 500].replace("\n", " ")
-            log(f"[debug] window around anchor: {window}")
-        else:
-            log(f"[debug] head sample: {page[:800].replace(chr(10), ' ')}")
+        for marker in ["homedepot.com/p/", "homedepot.com/s/"]:
+            i = page.find(marker)
+            if i != -1:
+                log(f"[debug] near {marker}: "
+                    f"{page[max(0, i - 700):i + 200].replace(chr(10), ' ')}")
+                break
+        skum = re.search(r"\d{3,4}-\d{3}-\d{3}", page)
+        if skum:
+            j = skum.start()
+            log(f"[debug] near sku: "
+                f"{page[max(0, j - 350):j + 250].replace(chr(10), ' ')}")
         ntfy("Penny notifier needs a tweak",
              "Ran but parsed 0 items. Send Claude the [debug] lines from the "
              "Actions log.", priority="high", tags="hammer_and_wrench")
         return 0
 
-    # Look up town-level sightings for each (cap to be polite to the site).
-    for d in finds[:60]:
+    # Town lookups are the slow part, so only open detail pages for items
+    # actually reported in NJ (the only ones that can carry an NJ/Bergen town).
+    # The big nationwide items get labeled without a lookup.
+    to_check = [d for d in finds if d["nj_reports"] > 0][:30]
+    log(f"[detail] looking up towns for {len(to_check)} NJ-reported item(s)")
+    for d in to_check:
         enrich_with_towns(d)
-    for d in finds[60:]:
-        d["towns"], d["bergen"] = [], []
+    for d in finds:
+        d.setdefault("towns", [])
+        d.setdefault("bergen", [])
 
     if BERGEN_ONLY:
         finds = [d for d in finds if d["bergen"]]
