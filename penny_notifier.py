@@ -37,6 +37,7 @@ STATE        = os.environ.get("PENNY_STATE", "NJ").strip()
 PENNY_URL    = os.environ.get("PENNY_URL", "https://www.pennycentral.com/penny-list").strip()
 NOTIFY_EMPTY = os.environ.get("NOTIFY_EMPTY", "0") == "1"
 DEBUG        = os.environ.get("PENNY_DEBUG", "0") == "1"
+LOOKUP_NAMES = os.environ.get("LOOKUP_NAMES", "1") == "1"  # fill item name from SKU
 SEEN_FILE    = "seen.json"
 
 # state can be written as "NJ", "New Jersey", "N.J." -- accept all
@@ -195,7 +196,25 @@ def save_seen(seen):
 
 
 # ----------------------------- formatting -------------------------------------
-def field(d, *names):
+# Field names we look for, in priority order. Comparison is case-insensitive,
+# so "storeName", "store_name", "STORE" all match "storename" etc.
+NAME_KEYS  = ("title", "name", "product", "productname", "product_name",
+              "item", "itemname", "item_name", "description", "desc")
+SKU_KEYS   = ("sku", "upc", "internetnumber", "internet_number",
+              "modelnumber", "model", "itemid", "item_id")
+STORE_KEYS = ("store", "storename", "store_name", "storenumber", "store_number",
+              "city", "location", "address")
+STATE_KEYS = ("state", "statecode", "state_code")
+DATE_KEYS  = ("date", "reportedat", "reported_at", "createdat", "created_at",
+              "time", "timestamp", "reported")
+LINK_KEYS  = ("url", "link", "permalink", "href", "source")
+
+# Keys we never want to print (internal IDs, image blobs, etc.)
+SKIP_KEYS = {"id", "_id", "uuid", "__typename", "key", "slug", "image",
+             "images", "img", "thumbnail", "photo", "hash", "raw", "icon"}
+
+
+def field(d, names):
     for n in names:
         for kk in d:
             if kk.lower() == n and d[kk] not in (None, ""):
@@ -203,19 +222,64 @@ def field(d, *names):
     return ""
 
 
+def _useful(v):
+    """A value worth printing: short, non-empty, not a nested structure."""
+    if v is None or isinstance(v, (dict, list)):
+        return False
+    s = str(v).strip()
+    return bool(s) and len(s) <= 80 and s.lower() not in ("none", "null")
+
+
+def _label(k):
+    return k.replace("_", " ").strip().title()
+
+
+def lookup_product_name(code):
+    """Best-effort: turn a 12-13 digit UPC into a product name using upcitemdb's
+    free (no-key, rate-limited) endpoint. Returns '' on any failure -- a missing
+    name should never break the notification."""
+    if not LOOKUP_NAMES:
+        return ""
+    digits = re.sub(r"\D", "", code or "")
+    if len(digits) not in (12, 13):
+        return ""  # not a UPC we can look up (e.g. a Home Depot internal SKU)
+    try:
+        url = f"https://api.upcitemdb.com/prod/trial/lookup?upc={digits}"
+        req = urllib.request.Request(url, headers={"User-Agent": BROWSER_HEADERS["User-Agent"]})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        items = data.get("items") or []
+        if items and items[0].get("title"):
+            return str(items[0]["title"]).strip()
+    except Exception as e:
+        log(f"[lookup] could not resolve {digits}: {e}")
+    return ""
+
+
 def describe(d):
-    title = field(d, "title", "name", "product", "description") or "Penny find"
-    sku   = field(d, "sku", "upc", "internetnumber", "modelnumber", "item")
-    where = field(d, "store", "city", "location") or field(d, "state")
-    when  = field(d, "date", "reportedat", "createdat", "time")
-    bits = [title]
-    if sku:
-        bits.append(f"SKU {sku}")
-    if where:
-        bits.append(where)
-    if when:
-        bits.append(when)
-    return " | ".join(bits)
+    name  = field(d, NAME_KEYS)
+    sku   = field(d, SKU_KEYS)
+    store = field(d, STORE_KEYS)
+    state = field(d, STATE_KEYS)
+    date  = field(d, DATE_KEYS)
+    link  = field(d, LINK_KEYS)
+
+    # If the report didn't include a name, try to resolve it from the SKU.
+    if not name and sku:
+        name = lookup_product_name(sku)
+
+    where = store or state or "not listed in report"
+
+    lines = [
+        f"Item:  {name or 'not listed in report'}",
+        f"Store: {where}",
+        f"SKU:   {sku or 'n/a'}",
+    ]
+    if date:
+        lines.append(f"Date:  {date}")
+    if link:
+        lines.append(link)
+    return "\n".join(lines)
 
 
 # ----------------------------- notifying --------------------------------------
@@ -256,6 +320,12 @@ def main():
 
     finds, strategy = get_finds(htmltext)
 
+    if DEBUG and finds:
+        log("[debug] sample raw finds (first 3) -- send these to Claude to "
+            "fine-tune field names:")
+        for d in finds[:3]:
+            log("  " + json.dumps(d, default=str)[:600])
+
     if strategy == "none":
         # Nothing parsed -- almost always means the page layout differs from my
         # guess, OR the data is loaded by JavaScript and isn't in the raw HTML.
@@ -290,10 +360,10 @@ def main():
         save_seen(seen)
         return 0
 
-    lines = [describe(d) for d in new[:40]]
-    body = "\n".join(f"• {ln}" for ln in lines)
-    if len(new) > 40:
-        body += f"\n…and {len(new) - 40} more."
+    blocks = [describe(d) for d in new[:30]]
+    body = "\n\n".join(blocks)
+    if len(new) > 30:
+        body += f"\n\n…and {len(new) - 30} more."
     body += "\n\nLeads only — verify with a UPC scan at the store."
 
     ntfy(f"{len(new)} new {STATE} penny find(s)", body,
