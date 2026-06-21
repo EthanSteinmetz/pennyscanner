@@ -1,0 +1,41 @@
+name: Penny Notifier
+
+# WHEN it runs:
+on:
+  schedule:
+    # Times are in UTC. 10:00 UTC = 6:00am Eastern (summer) / 5:00am (winter).
+    # Home Depot Paramus typically opens 6am, so this lands before open.
+    # GitHub may delay scheduled runs by 5-20 min during busy periods -- normal.
+    - cron: "0 10 * * *"
+  workflow_dispatch:   # <- adds a manual "Run workflow" button for testing
+
+# The job needs permission to commit seen.json back to the repo:
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run the notifier
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          PENNY_STATE: "NJ"
+          # NOTIFY_EMPTY: "1"   # uncomment if you want a ping even on quiet days
+        run: python penny_notifier.py
+
+      - name: Remember what was already sent
+        run: |
+          git config user.name "penny-bot"
+          git config user.email "penny-bot@users.noreply.github.com"
+          git add seen.json || true
+          git commit -m "Update seen finds" || echo "nothing to commit"
+          git push || echo "nothing to push"
