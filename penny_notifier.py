@@ -252,8 +252,8 @@ def main():
         skum = re.search(r"\d{3,4}-\d{3}-\d{3}", page)
         if skum:
             j = skum.start()
-            log(f"[debug] near sku: "
-                f"{page[max(0, j - 350):j + 250].replace(chr(10), ' ')}")
+            log(f"[debug] card from sku: "
+                f"{page[max(0, j - 100):j + 2200].replace(chr(10), ' ')}")
         ntfy("Penny notifier needs a tweak",
              "Ran but parsed 0 items. Send Claude the [debug] lines from the "
              "Actions log.", priority="high", tags="hammer_and_wrench")
