@@ -29,6 +29,7 @@ import os
 import re
 import sys
 import json
+import gzip
 import html
 import hashlib
 import urllib.request
@@ -69,10 +70,17 @@ def log(*a):
 
 
 def fetch(url):
-    req = urllib.request.Request(url, headers={"User-Agent": UA,
-                                               "Accept": "text/html,*/*"})
+    req = urllib.request.Request(url, headers={
+        "User-Agent": UA,
+        "Accept": "text/html,application/xhtml+xml,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, identity",
+    })
     with urllib.request.urlopen(req, timeout=30) as resp:
-        return resp.read().decode("utf-8", "replace")
+        data = resp.read()
+        if resp.headers.get("Content-Encoding") == "gzip":
+            data = gzip.decompress(data)
+    return data.decode("utf-8", "replace")
 
 
 # --- parse the main penny list -------------------------------------------------
@@ -232,8 +240,17 @@ def main():
     log(f"[result] NJ-relevant finds: {len(finds)}")
 
     if not finds:
-        log(f"[debug] page len {len(page)}; has 'SKU': {'SKU' in page}; "
-            f"has '{STATE}': {STATE in page}")
+        log(f"[debug] page len {len(page)}")
+        for tok in ["$0.01", "SKU", "homedepot.com", "__next_f", "pennycentral"]:
+            log(f"[debug] contains {tok!r}: {tok in page}")
+        anchor = page.find("$0.01")
+        if anchor == -1:
+            anchor = page.find("SKU")
+        if anchor != -1:
+            window = page[max(0, anchor - 200):anchor + 500].replace("\n", " ")
+            log(f"[debug] window around anchor: {window}")
+        else:
+            log(f"[debug] head sample: {page[:800].replace(chr(10), ' ')}")
         ntfy("Penny notifier needs a tweak",
              "Ran but parsed 0 items. Send Claude the [debug] lines from the "
              "Actions log.", priority="high", tags="hammer_and_wrench")
