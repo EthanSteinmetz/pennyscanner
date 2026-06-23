@@ -83,14 +83,33 @@ def fetch(url, timeout=30):
     return data.decode("utf-8", "replace")
 
 
-# --- parse the main penny list -------------------------------------------------
-BLOCK = re.compile(
-    r"\$0\.01"
-    r"(?s:.*?)SKU[\s:]*([0-9][0-9\-]+)"
-    r"(?s:.*?)(\d+)\s*reports?(?s:.{0,6}?)(\d+)\s*states?"
-    r"(?s:.*?)([A-Z]{2}\d+(?:[A-Z]{2}\d+)*)(?:\s*\+\s*(\d+)\s*more)?"
-    r"(?s:.*?)(https?://www\.homedepot\.com/[ps]/[^\s\"'<>)\]]+)"
+# --- parse the main penny list ------------------------------------------------
+# Two strategies, because the page can arrive as raw HTML or as rendered text.
+# Strategy A reads the raw HTML's aria-label anchors; Strategy B reads the
+# rendered-text layout. parse_list tries A, then falls back to B.
+NAME_BLOCK = re.compile(
+    r'aria-label="View state breakdown for ([^"]+)"'
+    r'(?s:.*?)aria-label="States with reports">(.*?)</div>'
 )
+CODE_RE = re.compile(r'>([A-Z]{2})</span>')
+MORE_RE = re.compile(r'\+<!--\s*-->\s*(\d+)')
+SKU_RE  = re.compile(r'Copy SKU (\d+) to clipboard|<span>SKU:</span><span[^>]*>([\d-]+)</span>')
+HD_RE   = re.compile(r'href="(https://www\.homedepot\.com/[ps]/[^"]+)"')
+BLOCK_B = re.compile(
+    r'SKU[\s:]*([0-9][0-9\-]+)'
+    r'(?s:.*?)(\d+)\s*reports?(?s:.{0,8}?)(\d+)\s*states?'
+    r'(?s:.*?)([A-Z]{2}\d+(?:[A-Z]{2}\d+)*)(?:\s*\+\s*(\d+)\s*more)?'
+    r'(?s:.*?)(https?://www\.homedepot\.com/[ps]/[^\s"\'<>)\]]+)'
+)
+
+
+def fmt_sku(s):
+    d = re.sub(r"\D", "", s)
+    if len(d) == 10:
+        return f"{d[0:4]}-{d[4:7]}-{d[7:]}"
+    if len(d) == 6:
+        return f"{d[0:3]}-{d[3:]}"
+    return d or "?"
 
 
 def name_from_url(url):
@@ -100,23 +119,57 @@ def name_from_url(url):
     return ""
 
 
-def parse_list(page):
-    page = html.unescape(page)
+def _strategy_a(page):
     finds = []
-    for m in BLOCK.finditer(page):
-        sku, reports, states, statedist, _more, url = m.groups()
+    for m in NAME_BLOCK.finditer(page):
+        name, states_html = m.groups()
+        codes = CODE_RE.findall(states_html)
+        more = MORE_RE.search(states_html)
+        states_count = len(codes) + (int(more.group(1)) if more else 0)
+        nj_present = STATE in codes
+        if not nj_present and states_count < STATE_THRESHOLD:
+            continue
+        pre = page[max(0, m.start() - 2500):m.start()]
+        skus = SKU_RE.findall(pre)
+        sku = fmt_sku(skus[-1][0] or skus[-1][1]) if skus else "?"
+        hd = HD_RE.search(page[m.end():m.end() + 2000])
+        finds.append({
+            "sku": sku,
+            "name": html.unescape(name).strip() or "(name not listed — tap link)",
+            "url": hd.group(1) if hd else f"https://www.homedepot.com/s/{sku.replace('-', '')}",
+            "states": states_count,
+            "nj_reports": 1 if nj_present else 0,
+        })
+    return finds
+
+
+def _strategy_b(page):
+    finds = []
+    for m in BLOCK_B.finditer(page):
+        sku, _reports, states, dist, _more, url = m.groups()
         states = int(states)
-        njm = re.search(rf"{STATE}(\d+)", statedist)
+        njm = re.search(rf"{STATE}(\d+)", dist)
         nj_reports = int(njm.group(1)) if njm else 0
         if nj_reports == 0 and states < STATE_THRESHOLD:
             continue
         finds.append({
-            "sku": sku,
+            "sku": fmt_sku(sku),
             "name": name_from_url(url) or "(name not listed — tap link)",
             "url": url,
             "states": states,
             "nj_reports": nj_reports,
         })
+    return finds
+
+
+def parse_list(page):
+    finds = _strategy_a(page)
+    if finds:
+        log(f"[parse] strategy A (raw html): {len(finds)}")
+        return finds
+    finds = _strategy_b(page)
+    if finds:
+        log(f"[parse] strategy B (rendered): {len(finds)}")
     return finds
 
 
@@ -241,22 +294,21 @@ def main():
 
     if not finds:
         log(f"[debug] page len {len(page)}")
-        for tok in ["$0.01", "SKU", "homedepot.com", "__next_f", "pennycentral"]:
-            log(f"[debug] contains {tok!r}: {tok in page}")
-        for marker in ["homedepot.com/p/", "homedepot.com/s/"]:
-            i = page.find(marker)
-            if i != -1:
-                log(f"[debug] near {marker}: "
-                    f"{page[max(0, i - 700):i + 200].replace(chr(10), ' ')}")
-                break
-        skum = re.search(r"\d{3,4}-\d{3}-\d{3}", page)
-        if skum:
-            j = skum.start()
-            log(f"[debug] card from sku: "
-                f"{page[max(0, j - 100):j + 2200].replace(chr(10), ' ')}")
+        counts = {
+            "view-breakdown anchors": len(re.findall(r'View state breakdown for', page)),
+            "states-with-reports anchors": len(re.findall(r'States with reports', page)),
+            "copy-sku anchors": len(re.findall(r'Copy SKU \d+', page)),
+            "homedepot links": len(re.findall(r'homedepot\.com/[ps]/', page)),
+            "listitem state spans": len(re.findall(r'role="listitem"', page)),
+        }
+        for k, v in counts.items():
+            log(f"[debug] {k}: {v}")
+        i = page.find("View state breakdown for")
+        if i != -1:
+            log(f"[debug] sample block: {page[i:i + 900].replace(chr(10), ' ')}")
         ntfy("Penny notifier needs a tweak",
-             "Ran but parsed 0 items. Send Claude the [debug] lines from the "
-             "Actions log.", priority="high", tags="hammer_and_wrench")
+             "Ran but parsed 0 items. Send Claude the [debug] lines.",
+             priority="high", tags="hammer_and_wrench")
         return 0
 
     # Town lookups are the slow part, so only open detail pages for items
